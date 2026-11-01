@@ -1,7 +1,3 @@
-// Thin wrapper around the FastAPI backend.
-// Auth: the backend sets an HttpOnly cookie, but browsers often drop it on cross-site
-// requests (Vercel -> Render). So we also keep the session token from POST /api/sessions
-// in localStorage and send it as X-Session-Token; the backend accepts header or cookie.
 const BASE = import.meta.env.VITE_API_URL || ''
 const TOKEN_KEY = 'nyaya_session_token'
 
@@ -18,7 +14,6 @@ function rawFetch(path, options = {}) {
   })
 }
 
-// One shared in-flight promise, so concurrent calls never create several sessions.
 let sessionPromise = null
 
 async function createSession(reset = false) {
@@ -35,7 +30,7 @@ async function createSession(reset = false) {
         return data
       })
       .catch((e) => {
-        sessionPromise = null // allow a later retry
+        sessionPromise = null
         throw e
       })
   }
@@ -43,10 +38,10 @@ async function createSession(reset = false) {
 }
 
 async function request(path, options = {}, retried = false) {
-  await createSession() // no API call fires before a session exists
+  await createSession()
   const res = await rawFetch(path, options)
   if (res.status === 401 && !retried) {
-    await createSession(true) // session expired/wiped: make a new one once, retry once
+    await createSession(true)
     return request(path, options, true)
   }
   if (!res.ok) {

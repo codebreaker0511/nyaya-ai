@@ -57,7 +57,6 @@ def get_current_session(
     cookie_token: str | None = Cookie(default=None, alias=config.SESSION_COOKIE_NAME),
     header_token: str | None = Header(default=None, alias="X-Session-Token"),
 ) -> AnonymousSession:
-    # Header first (works when browsers block cross-site cookies), then the cookie.
     s = _find_valid_session(db, header_token or cookie_token)
     if s is None:
         raise HTTPException(401, "Session missing or expired. Call POST /api/sessions first.")
