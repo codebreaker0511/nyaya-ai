@@ -12,14 +12,14 @@ def _bool(name: str, default: bool) -> bool:
 
 
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173").strip().rstrip("/")
 
 # Session cookie
 SESSION_COOKIE_NAME = "nyaya_session"
 SESSION_EXPIRY_DAYS = int(os.getenv("SESSION_EXPIRY_DAYS", "7"))
 # Secure cookies are required in production (HTTPS). SameSite=none is needed when
 # frontend and backend are on different domains (e.g. Render + Vercel).
-COOKIE_SECURE = _bool("COOKIE_SECURE", ENVIRONMENT == "production")
+COOKIE_SECURE = _bool("COOKIE_SECURE", ENVIRONMENT == "production" or FRONTEND_ORIGIN.startswith("https://"))
 COOKIE_SAMESITE = os.getenv("COOKIE_SAMESITE", "none" if COOKIE_SECURE else "lax")
 
 # LLM (any OpenAI-compatible chat-completions API)
