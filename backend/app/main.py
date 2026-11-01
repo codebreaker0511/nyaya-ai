@@ -17,7 +17,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Nyaya AI", lifespan=lifespan)
 
-# Credentialed requests require explicit origins (never "*").
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[config.FRONTEND_ORIGIN],
