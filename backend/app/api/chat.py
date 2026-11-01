@@ -5,7 +5,7 @@ import secrets
 import uuid
 from datetime import timedelta
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Response
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -54,9 +54,11 @@ def _find_valid_session(db: Session, token: str | None) -> AnonymousSession | No
 
 def get_current_session(
     db: Session = Depends(get_db),
-    token: str | None = Cookie(default=None, alias=config.SESSION_COOKIE_NAME),
+    cookie_token: str | None = Cookie(default=None, alias=config.SESSION_COOKIE_NAME),
+    header_token: str | None = Header(default=None, alias="X-Session-Token"),
 ) -> AnonymousSession:
-    s = _find_valid_session(db, token)
+    # Header first (works when browsers block cross-site cookies), then the cookie.
+    s = _find_valid_session(db, header_token or cookie_token)
     if s is None:
         raise HTTPException(401, "Session missing or expired. Call POST /api/sessions first.")
     # Sliding expiry: activity extends the session.
@@ -79,8 +81,10 @@ def get_owned_conversation(conversation_id: uuid.UUID, db: Session, session: Ano
 def init_session(
     response: Response,
     db: Session = Depends(get_db),
-    token: str | None = Cookie(default=None, alias=config.SESSION_COOKIE_NAME),
+    cookie_token: str | None = Cookie(default=None, alias=config.SESSION_COOKIE_NAME),
+    header_token: str | None = Header(default=None, alias="X-Session-Token"),
 ):
+    token = header_token or cookie_token
     s = _find_valid_session(db, token)
     if s is None:
         token = secrets.token_urlsafe(32)
@@ -89,7 +93,7 @@ def init_session(
     s.last_active_at = utcnow()
     s.expires_at = utcnow() + timedelta(days=config.SESSION_EXPIRY_DAYS)
     _set_cookie(response, token)
-    return SessionOut(expires_at=s.expires_at)
+    return SessionOut(expires_at=s.expires_at, token=token)
 
 
 @router.post("/conversations", response_model=ConversationOut, status_code=201)

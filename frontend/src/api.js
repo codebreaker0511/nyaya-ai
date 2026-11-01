@@ -1,13 +1,54 @@
-// Thin wrapper around the FastAPI backend. The session lives in an HttpOnly cookie,
-// so every request must send credentials.
+// Thin wrapper around the FastAPI backend.
+// Auth: the backend sets an HttpOnly cookie, but browsers often drop it on cross-site
+// requests (Vercel -> Render). So we also keep the session token from POST /api/sessions
+// in localStorage and send it as X-Session-Token; the backend accepts header or cookie.
 const BASE = import.meta.env.VITE_API_URL || ''
+const TOKEN_KEY = 'nyaya_session_token'
 
-async function request(path, options = {}) {
-  const res = await fetch(`${BASE}${path}`, {
+function rawFetch(path, options = {}) {
+  const token = localStorage.getItem(TOKEN_KEY)
+  return fetch(`${BASE}${path}`, {
     credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
     ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { 'X-Session-Token': token } : {}),
+      ...options.headers,
+    },
   })
+}
+
+// One shared in-flight promise, so concurrent calls never create several sessions.
+let sessionPromise = null
+
+async function createSession(reset = false) {
+  if (reset) {
+    localStorage.removeItem(TOKEN_KEY)
+    sessionPromise = null
+  }
+  if (!sessionPromise) {
+    sessionPromise = rawFetch('/api/sessions', { method: 'POST' })
+      .then(async (res) => {
+        if (!res.ok) throw new Error('Could not start a session.')
+        const data = await res.json()
+        localStorage.setItem(TOKEN_KEY, data.token)
+        return data
+      })
+      .catch((e) => {
+        sessionPromise = null // allow a later retry
+        throw e
+      })
+  }
+  return sessionPromise
+}
+
+async function request(path, options = {}, retried = false) {
+  await createSession() // no API call fires before a session exists
+  const res = await rawFetch(path, options)
+  if (res.status === 401 && !retried) {
+    await createSession(true) // session expired/wiped: make a new one once, retry once
+    return request(path, options, true)
+  }
   if (!res.ok) {
     let detail = 'Something went wrong. Please try again.'
     try {
@@ -24,7 +65,7 @@ async function request(path, options = {}) {
   return res.status === 204 ? null : res.json()
 }
 
-export const initSession = () => request('/api/sessions', { method: 'POST' })
+export const initSession = () => createSession()
 export const listConversations = () => request('/api/conversations')
 export const createConversation = () =>
   request('/api/conversations', { method: 'POST', body: JSON.stringify({}) })

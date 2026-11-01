@@ -22,7 +22,7 @@ app.add_middleware(
     allow_origins=[config.FRONTEND_ORIGIN],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "X-Session-Token"],
 )
 
 app.include_router(chat.router)

@@ -15,6 +15,7 @@ class Citation(BaseModel):
 
 class SessionOut(BaseModel):
     expires_at: datetime
+    token: str  # also sent as a cookie; clients that can't keep cookies send it as X-Session-Token
 
 
 class ConversationCreate(BaseModel):
