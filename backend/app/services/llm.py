@@ -33,12 +33,31 @@ use plain paragraphs, and avoid headings, bold text and long lists unless a shor
 helps. This is general legal information, not legal advice; mention that briefly, not in every message."""
 
 
-def generate_answer(question: str, history: list[dict]) -> str:
+# Added to the system prompt only when retrieval found relevant passages. When it found nothing, the
+# model gets the plain SYSTEM_PROMPT and answers from its own knowledge, as it did before RAG.
+RAG_PROMPT = """
+
+Below are passages from the Constitution of India that were retrieved for this question. Treat them as the authoritative text:
+- Where they are relevant, base your answer on them: explain them in plain language and name the Article (e.g. "Article 21"). Only say a provision says something if the passage actually says it; never attribute anything else to an Article.
+- Some passages may be irrelevant; ignore those.
+- If the passages only partly answer the question (for example it is also about an ordinary Act such as the BNS, BNSS, consumer or tenancy law, or about practical steps), answer that part from your general knowledge, but make clear it is general information and not from the Constitution, and do not guess section numbers.
+- Follow all the style, length and formatting rules above. Do not mention "passages", "context" or "retrieved text" to the user, and do not add bracketed citations or a list of sources."""
+
+
+def format_passages(passages: list[dict]) -> str:
+    blocks = [f"[{i}] {p['text']}" for i, p in enumerate(passages, 1)]
+    return "\n\n".join(blocks)
+
+
+def generate_answer(question: str, history: list[dict], passages: list[dict] | None = None) -> str:
     if not config.LLM_API_KEY:
         logger.error("LLM_API_KEY is not configured")
         raise LLMError("The AI service is not configured.")
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": question}]
+    system = SYSTEM_PROMPT
+    if passages:
+        system += RAG_PROMPT + "\n\nPassages:\n" + format_passages(passages)
+    messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": question}]
     headers = {"Authorization": f"Bearer {config.LLM_API_KEY}"}
 
     try:

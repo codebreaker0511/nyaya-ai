@@ -7,11 +7,13 @@ from app import config
 from app.api import chat
 from app.db.database import Base, engine
 from app.models import conversation, message, session  # noqa: F401  (registers tables)
+from app.services import rag
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)  # creates any missing tables on startup
+    rag.load_index()  # read the legal index into memory now, not during the first user's request
     yield
 
 

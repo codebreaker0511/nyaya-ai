@@ -22,7 +22,7 @@ from app.schemas.chat import (
     SendMessageOut,
     SessionOut,
 )
-from app.services import llm
+from app.services import llm, rag
 
 logger = logging.getLogger("nyaya.chat")
 router = APIRouter(prefix="/api")
@@ -163,8 +163,11 @@ def send_message(
     # (in a second thread) so it adds no waiting time.
     is_first = not recent
     title_future = _pool.submit(llm.generate_title, body.content) if is_first else None
+    # Look up relevant constitutional text for *this* question (history only helps interpret follow-ups).
+    # An empty list means nothing relevant was found, and the LLM then answers on its own.
+    passages = rag.retrieve(body.content, history)
     try:
-        reply = llm.generate_answer(body.content, history)
+        reply = llm.generate_answer(body.content, history, passages)
     except llm.LLMError as e:
         raise HTTPException(503, str(e))
     if title_future is not None:

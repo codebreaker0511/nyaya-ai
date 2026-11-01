@@ -28,6 +28,17 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/"
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-6-sol")
 LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "45"))
 
+# Embeddings (same key/base URL as the LLM unless overridden) for the RAG index
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+
 # Chat limits
 MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "2000"))
 HISTORY_MESSAGES = int(os.getenv("HISTORY_MESSAGES", "6"))
+
+# RAG over the pre-built Constitution index (backend/data/index, built by scripts/ingest.py)
+RAG_ENABLED = _bool("RAG_ENABLED", True)
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "4"))  # passages given to the LLM
+# Cosine-similarity cutoff: passages scoring below this are treated as "not relevant" and the
+# LLM answers without them. Tune with scripts/eval_rag.py.
+RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.30"))
+RAG_EMBED_TIMEOUT_SECONDS = float(os.getenv("RAG_EMBED_TIMEOUT_SECONDS", "10"))
