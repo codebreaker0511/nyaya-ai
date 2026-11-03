@@ -5,7 +5,7 @@ import secrets
 import uuid
 from datetime import timedelta
 
-from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -22,11 +22,23 @@ from app.schemas.chat import (
     SendMessageOut,
     SessionOut,
 )
-from app.services import llm, rag
+from app.services import limits, llm, rag
 
 logger = logging.getLogger("nyaya.chat")
 router = APIRouter(prefix="/api")
 _pool = ThreadPoolExecutor(max_workers=4)
+
+
+def _limit_http(e: limits.LimitError) -> HTTPException:
+    """Turn a LimitError into a JSON error the frontend can tell apart by `code`."""
+    detail = {"code": e.code, "message": e.message}
+    headers = None
+    if e.retry_after is not None:
+        detail["retry_after_seconds"] = e.retry_after
+        headers = {"Retry-After": str(e.retry_after)}
+    if e.resets_at is not None:
+        detail["resets_at"] = e.resets_at.isoformat()
+    return HTTPException(e.status, detail, headers=headers)
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
@@ -79,6 +91,7 @@ def get_owned_conversation(conversation_id: uuid.UUID, db: Session, session: Ano
 @router.post("/sessions", response_model=SessionOut)
 def init_session(
     response: Response,
+    request: Request,
     db: Session = Depends(get_db),
     cookie_token: str | None = Cookie(default=None, alias=config.SESSION_COOKIE_NAME),
     header_token: str | None = Header(default=None, alias="X-Session-Token"),
@@ -86,6 +99,11 @@ def init_session(
     token = header_token or cookie_token
     s = _find_valid_session(db, token)
     if s is None:
+        # New sessions get a fresh quota, so limit how fast one network can create them.
+        try:
+            limits.check_session_creation_rate(limits.client_ip(request))
+        except limits.LimitError as e:
+            raise _limit_http(e)
         token = secrets.token_urlsafe(32)
         s = AnonymousSession(token_hash=hash_token(token), expires_at=utcnow())
         db.add(s)
@@ -138,10 +156,19 @@ def delete_conversation(
 def send_message(
     conversation_id: uuid.UUID,
     body: MessageCreate,
+    request: Request,
     db: Session = Depends(get_db),
     session: AnonymousSession = Depends(get_current_session),
 ):
     conv = get_owned_conversation(conversation_id, db, session)
+
+    # Abuse protection, before any paid API call (embeddings or LLM):
+    # per-minute request limits, then a quick "is today's allowance already used up?" check.
+    try:
+        limits.check_message_rate(session.id, limits.client_ip(request))
+        limits.ensure_quota_available(session.id)
+    except limits.LimitError as e:
+        raise _limit_http(e)
 
     # Recent history (before this message) is used only to interpret follow-ups.
     recent = db.scalars(
@@ -151,29 +178,53 @@ def send_message(
         .limit(config.HISTORY_MESSAGES)
     ).all()
     history = [{"role": m.role, "content": m.content} for m in reversed(recent)]
-
-    user_msg = Message(conversation_id=conv.id, role="user", content=body.content)
-    db.add(user_msg)
-    if not recent:
-        conv.title = body.content[:60]
-    # Commit now so the user's message survives even if the LLM call fails.
-    db.commit()
-
-    # For a chat's first message, generate the sidebar title at the same time as the answer
-    # (in a second thread) so it adds no waiting time.
     is_first = not recent
-    title_future = _pool.submit(llm.generate_title, body.content) if is_first else None
+
     # Look up relevant constitutional text for *this* question (history only helps interpret follow-ups).
     # An empty list means nothing relevant was found, and the LLM then answers on its own.
     passages = rag.retrieve(body.content, history)
+
+    # Reserve the worst case (estimated prompt + maximum output, for the answer and, on a chat's first
+    # message, the title) BEFORE calling the LLM. If it doesn't fit, nothing is saved or called.
+    input_estimate = llm.estimate_tokens(llm.build_messages(body.content, history, passages))
+    reserve_amount = input_estimate + config.LLM_MAX_OUTPUT_TOKENS
+    if is_first:
+        title_estimate = llm.estimate_tokens(llm.build_title_messages(body.content))
+        input_estimate += title_estimate
+        reserve_amount += title_estimate + config.LLM_TITLE_MAX_OUTPUT_TOKENS
     try:
-        reply = llm.generate_answer(body.content, history, passages)
-    except llm.LLMError as e:
-        raise HTTPException(503, str(e))
-    if title_future is not None:
-        title = title_future.result()
-        if title:
-            conv.title = title
+        reservation = limits.reserve(session.id, reserve_amount, input_estimate)
+    except limits.LimitError as e:
+        raise _limit_http(e)
+
+    answer_usage, title_usage = llm.TokenUsage(), llm.TokenUsage()
+    title_future = None
+    try:
+        user_msg = Message(conversation_id=conv.id, role="user", content=body.content)
+        db.add(user_msg)
+        if is_first:
+            conv.title = body.content[:60]
+        # Commit now so the user's message survives even if the LLM call fails. This also ends the
+        # transaction, so no database transaction is held open during the slow LLM call.
+        db.commit()
+
+        # For a chat's first message, generate the sidebar title at the same time as the answer
+        # (in a second thread) so it adds no waiting time.
+        title_future = _pool.submit(llm.generate_title, body.content, title_usage) if is_first else None
+        try:
+            reply = llm.generate_answer(body.content, history, passages, usage=answer_usage)
+        except llm.LLMError as e:
+            raise HTTPException(503, str(e))
+        title = title_future.result() if title_future is not None else None
+    finally:
+        # Always settle, even on errors: wait for the title call so its tokens are counted too
+        # (generate_title never raises), then swap the reservation for the real usage.
+        if title_future is not None:
+            title_future.result()
+        limits.settle(reservation, answer_usage.total + title_usage.total)
+
+    if title:
+        conv.title = title
 
     assistant_msg = Message(conversation_id=conv.id, role="assistant", content=reply)
     db.add(assistant_msg)

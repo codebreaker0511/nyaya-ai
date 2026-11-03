@@ -39,6 +39,24 @@ function Sources({ citations }) {
   )
 }
 
+// Friendly text for limit errors from the backend (see services/limits.py); other errors keep their message.
+function errorText(e) {
+  if (e.code === 'daily_quota_exceeded' || e.code === 'service_budget_exhausted') {
+    const resetAt = e.resetsAt ? new Date(e.resetsAt) : null
+    const when =
+      resetAt && !Number.isNaN(resetAt.getTime())
+        ? resetAt.toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' })
+        : 'tomorrow'
+    return e.code === 'daily_quota_exceeded'
+      ? `You've used today's free allowance. You can ask again after ${when}.`
+      : `Nyaya-AI has reached its usage limit for today. Please try again after ${when}.`
+  }
+  if (e.code === 'rate_limited' && e.retryAfter) {
+    return `${e.message} (You can try again in about ${e.retryAfter} seconds.)`
+  }
+  return e.message
+}
+
 function Message({ m }) {
   if (m.role === 'user') {
     return (
@@ -91,6 +109,8 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 820)
   const endRef = useRef(null)
   const textareaRef = useRef(null)
+  // Guards against double submits (e.g. Enter pressed twice) before the `sending` state re-renders.
+  const sendingRef = useRef(false)
 
   // On first load: start/refresh the anonymous session and restore the latest conversation.
   useEffect(() => {
@@ -173,7 +193,8 @@ export default function App() {
 
   async function send(text) {
     const content = text.trim()
-    if (!content || sending) return
+    if (!content || sending || sendingRef.current) return
+    sendingRef.current = true
     setError('')
     setInput('')
     setSending(true)
@@ -206,9 +227,10 @@ export default function App() {
         setMessages([])
         setError('Your session expired, so the chat was reset. Please send your question again.')
       } else {
-        setError(e.message)
+        setError(errorText(e))
       }
     } finally {
+      sendingRef.current = false
       setSending(false)
       textareaRef.current?.focus()
     }

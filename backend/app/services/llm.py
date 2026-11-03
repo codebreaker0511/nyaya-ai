@@ -1,5 +1,6 @@
 """LLM integration over an OpenAI-compatible chat-completions API (via httpx)."""
 import logging
+from dataclasses import dataclass
 
 import httpx
 
@@ -10,6 +11,80 @@ logger = logging.getLogger("nyaya.llm")
 
 class LLMError(Exception):
     """Raised for any LLM failure. The message is safe to show users; details only go to logs."""
+
+
+@dataclass
+class TokenUsage:
+    """Tokens one LLM call cost. The caller passes an empty one in; it is filled in even when the call fails.
+
+    Normally the numbers come from the provider's `usage` field. `estimated` is True when the provider
+    did not report usage and we had to guess (see estimate_tokens).
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    estimated: bool = False
+
+    @property
+    def total(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+def estimate_tokens(messages: list[dict]) -> int:
+    """Deliberately generous token estimate, used only (a) to RESERVE quota before a call and (b) as a
+    fallback when the provider reports no usage. Real accounting uses the provider's numbers.
+
+    English averages about 4 characters per token and Hindi/Devanagari text about 3 UTF-8 bytes per
+    character, so "UTF-8 bytes / 2" is well above the real count in both cases. The +8s cover the
+    small per-message overhead the API adds.
+    """
+    return sum(len(m["content"].encode("utf-8")) // 2 + 8 for m in messages) + 8
+
+
+def _output_cap(max_tokens: int) -> dict:
+    return {config.LLM_MAX_TOKENS_PARAM: max_tokens} if max_tokens > 0 else {}
+
+
+def _content(data) -> str:
+    try:
+        return data["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+def _record_usage(usage: TokenUsage | None, data, messages: list[dict]) -> None:
+    """Copy the provider's token counts into `usage` (input + output, including RAG passages and history,
+    since they are all part of the prompt the provider counted)."""
+    if usage is None:
+        return
+    try:
+        u = data["usage"]
+        usage.input_tokens = int(u["prompt_tokens"])
+        usage.output_tokens = int(u["completion_tokens"])
+        return
+    except (KeyError, TypeError, ValueError):
+        pass
+    logger.warning("LLM response had no usage data; charging an estimate instead")
+    usage.input_tokens = estimate_tokens(messages)
+    usage.output_tokens = len(_content(data).encode("utf-8")) // 2 + 1
+    usage.estimated = True
+
+
+def _charge_if_uncertain(usage: TokenUsage | None, messages: list[dict], exc: Exception) -> None:
+    """After a failed call, decide what it cost when the provider never told us.
+
+    - The request never reached the provider (connection refused / connect timeout): nothing.
+    - The provider answered with an HTTP error status: nothing (failed requests are not billed).
+    - Anything else (read timeout, dropped connection, unreadable body): the prompt was probably
+      processed, so charge the estimated input tokens. The unused output part of the reservation
+      is released. This is the conservative middle ground between "free" and "full reservation".
+    """
+    if usage is None or usage.total > 0:
+        return  # nothing to record, or the provider already reported usage
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.HTTPStatusError)):
+        return
+    usage.input_tokens = estimate_tokens(messages)
+    usage.estimated = True
 
 
 SYSTEM_PROMPT = """You are Nyaya-AI, a legal awareness assistant for ordinary people in India.
@@ -49,30 +124,40 @@ def format_passages(passages: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 
-def generate_answer(question: str, history: list[dict], passages: list[dict] | None = None) -> str:
+def build_messages(question: str, history: list[dict], passages: list[dict] | None = None) -> list[dict]:
+    """The exact message list sent for an answer (also used to estimate its size before sending)."""
+    system = SYSTEM_PROMPT
+    if passages:
+        system += RAG_PROMPT + "\n\nPassages:\n" + format_passages(passages)
+    return [{"role": "system", "content": system}, *history, {"role": "user", "content": question}]
+
+
+def generate_answer(
+    question: str, history: list[dict], passages: list[dict] | None = None, usage: TokenUsage | None = None
+) -> str:
     if not config.LLM_API_KEY:
         logger.error("LLM_API_KEY is not configured")
         raise LLMError("The AI service is not configured.")
 
-    system = SYSTEM_PROMPT
-    if passages:
-        system += RAG_PROMPT + "\n\nPassages:\n" + format_passages(passages)
-    messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": question}]
+    messages = build_messages(question, history, passages)
     headers = {"Authorization": f"Bearer {config.LLM_API_KEY}"}
 
     try:
         resp = httpx.post(
             f"{config.LLM_BASE_URL}/chat/completions",
-            json={"model": config.LLM_MODEL, "messages": messages},
+            json={"model": config.LLM_MODEL, "messages": messages, **_output_cap(config.LLM_MAX_OUTPUT_TOKENS)},
             headers=headers,
             timeout=config.LLM_TIMEOUT_SECONDS,
         )
         resp.raise_for_status()
-        answer = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+        data = resp.json()
+        _record_usage(usage, data, messages)  # before any further check: the provider has billed this
+        answer = (data["choices"][0]["message"]["content"] or "").strip()
         if not answer:
             raise ValueError("empty answer")
         return answer
-    except httpx.TimeoutException:
+    except httpx.TimeoutException as e:
+        _charge_if_uncertain(usage, messages, e)
         logger.warning("LLM request timed out")
         raise LLMError("The AI service took too long to respond. Please try again.")
     except httpx.HTTPStatusError as e:
@@ -80,7 +165,8 @@ def generate_answer(question: str, history: list[dict], passages: list[dict] | N
         if e.response.status_code == 429:
             raise LLMError("The AI service is busy. Please try again shortly.")
         raise LLMError("The AI service is currently unavailable.")
-    except (httpx.HTTPError, KeyError, IndexError, ValueError) as e:
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as e:
+        _charge_if_uncertain(usage, messages, e)
         logger.error("LLM call/parse failure: %s", type(e).__name__)
         raise LLMError("The AI service returned an unexpected response.")
 
@@ -92,26 +178,35 @@ TITLE_PROMPT = (
 )
 
 
-def generate_title(first_message: str) -> str | None:
+def build_title_messages(first_message: str) -> list[dict]:
+    return [
+        {"role": "system", "content": TITLE_PROMPT},
+        {"role": "user", "content": first_message[:500]},
+    ]
+
+
+def generate_title(first_message: str, usage: TokenUsage | None = None) -> str | None:
     """Short chat title for the sidebar. Never raises; returns None so the caller can fall back."""
     if not config.LLM_API_KEY:
         return None
+    messages = build_title_messages(first_message)
     try:
         resp = httpx.post(
             f"{config.LLM_BASE_URL}/chat/completions",
             json={
                 "model": config.LLM_MODEL,
-                "messages": [
-                    {"role": "system", "content": TITLE_PROMPT},
-                    {"role": "user", "content": first_message[:500]},
-                ],
+                "messages": messages,
+                **_output_cap(config.LLM_TITLE_MAX_OUTPUT_TOKENS),
             },
             headers={"Authorization": f"Bearer {config.LLM_API_KEY}"},
             timeout=15,
         )
         resp.raise_for_status()
-        title = (resp.json()["choices"][0]["message"]["content"] or "").strip().strip("\"'“”‘’*#").rstrip(".!?:")
+        data = resp.json()
+        _record_usage(usage, data, messages)
+        title = (data["choices"][0]["message"]["content"] or "").strip().strip("\"'“”‘’*#").rstrip(".!?:")
         return title[:60] or None
     except Exception as e:  # titles are cosmetic: any failure just means "use the fallback"
+        _charge_if_uncertain(usage, messages, e)
         logger.warning("Title generation failed: %s", type(e).__name__)
         return None

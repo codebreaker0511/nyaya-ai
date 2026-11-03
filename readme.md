@@ -130,6 +130,9 @@ Re-run `ingest.py` and commit the new files if the PDF or chunking changes. If y
 | `sessions` | Anonymous visitor: token hash, created, last active, expiry |
 | `conversations` | Chat threads, each belonging to one session |
 | `messages` | Messages in a conversation, with role (`user` / `assistant`) and optional citations |
+| `daily_token_usage` | Tokens used and reserved per session (and globally) per day; one row per key per day |
+| `token_reservations` | LLM calls in progress, so abandoned ones can be cleaned up |
+| `rate_limit_counters` | Request counts per session or IP per time window |
 
 Every conversation-specific endpoint checks that the conversation belongs to the caller's session. Other sessions' conversations return 404, so IDs cannot be probed.
 
@@ -151,6 +154,41 @@ Every conversation-specific endpoint checks that the conversation belongs to the
 - Message length is limited and blank messages are rejected.
 - LLM failures return a safe error message. Provider details and API keys are only logged, never shown to users.
 - The system prompt restricts the assistant to Indian legal questions and tells it not to invent provisions.
+
+### Abuse protection (rate limits and token quotas)
+
+Code: `services/limits.py`, tables in `models/usage.py`. All counters live in PostgreSQL, so they are shared by every worker and instance (no Redis needed at this scale).
+
+| Protection | Default | Response when hit |
+|---|---|---|
+| Messages per session per minute | `SESSION_RATE_LIMIT_PER_MINUTE=5` | 429 `rate_limited` + `Retry-After` |
+| Messages per IP per minute | `IP_RATE_LIMIT_PER_MINUTE=10` | 429 `rate_limited` + `Retry-After` |
+| New sessions per IP per hour | `SESSION_CREATE_LIMIT_PER_IP_PER_HOUR=30` | 429 `rate_limited` |
+| Tokens per session per day (input + output) | `DAILY_TOKEN_LIMIT=40000` | 429 `daily_quota_exceeded` + `resets_at` |
+| Tokens for all sessions together per day | `GLOBAL_DAILY_TOKEN_LIMIT=2000000` | 503 `service_budget_exhausted` |
+
+Errors are JSON: `{"detail": {"code", "message", "retry_after_seconds", "resets_at"}}`. The frontend shows a different message for each code.
+
+**How a message is counted**
+
+1. Rate limits are checked, then a quick "is today's allowance already used?" check. Both happen before any paid call, including the RAG embeddings call.
+2. Before calling the LLM, the backend reserves the worst case: an estimate of the prompt (system prompt, retrieved passages, history and question) plus the maximum output (`LLM_MAX_OUTPUT_TOKENS`, and the title call on a chat's first message). The reservation is one atomic `UPDATE ... WHERE used + reserved + amount <= limit` on both the session row and the global row, so simultaneous requests cannot together go over a limit. If it doesn't fit, nothing is saved and nothing is called.
+3. After the call, the reservation is replaced by the real `prompt_tokens + completion_tokens` from the provider's `usage` field. No database transaction is open during the LLM call.
+4. Failures: an HTTP error from the provider, or a request that never connected, costs nothing. A timeout or broken connection (outcome unknown) is charged the estimated prompt tokens only. If a request dies completely (crash or restart), its reservation is cleaned up after `RESERVATION_TTL_SECONDS` and charged the same way.
+5. If the provider returns no `usage`, the cost is estimated (UTF-8 bytes / 2, which is deliberately generous) and a warning is logged.
+6. If the limits cannot be checked (database error), no paid call is made (fail closed, 503).
+
+Days reset at midnight in `QUOTA_TIMEZONE` (default `UTC`; for example `Asia/Kolkata` resets at midnight IST).
+
+**Client IP behind a proxy.** `X-Forwarded-For` can be faked by the client, so it is ignored unless `TRUSTED_PROXY_HOPS` is set. With `TRUSTED_PROXY_HOPS=N`, the app takes the address N steps from the right of `X-Forwarded-For` plus the connecting address, which is the part written by your own proxies. On Render, set it in production after checking the real header (for example by temporarily logging `request.headers.get("x-forwarded-for")` and `request.client.host` for your own request). If it is left at `0` behind a proxy, every user shares the proxy's IP and the per-IP limit becomes one shared limit. Don't start uvicorn with `--forwarded-allow-ips="*"`.
+
+**Limits of this approach**
+
+- Clearing browser storage gives a new anonymous session and a new daily quota. The per-IP session-creation limit and the global ceiling bound the damage, but anonymous quotas cannot be strict per person.
+- People can rotate IPs, and many legitimate users can share one IP (college or office networks, mobile carriers), so IP limits are only an extra signal.
+- The global limit is a token ceiling, not a money budget: tokens are not converted to prices. Also set a spending limit and alerts in your LLM provider's dashboard.
+- The RAG embeddings call is not counted in the token quotas. It is much cheaper than chat, and it is skipped when a session or the global budget is already used up.
+- Rate limits use fixed one-minute windows, so a burst of up to twice the limit is possible across a window boundary.
 
 ## Project structure
 
@@ -179,13 +217,21 @@ npm install
 npm run dev
 ```
 
+**Tests** (from `backend/`). Database tests run only against a separate database named in `TEST_DATABASE_URL`, and are skipped otherwise, so they can never touch real data. The LLM is always mocked.
+
+```bash
+createdb -U postgres nyaya_ai_test
+TEST_DATABASE_URL=postgresql+psycopg://postgres:YOUR_PASSWORD@localhost:5432/nyaya_ai_test python -m pytest
+```
+
 The frontend runs at http://localhost:5173 and proxies `/api` to the backend at http://localhost:8000. Leave `VITE_API_URL` empty in development.
 
 ## Deployment
 
 - **Frontend (Vercel):** root directory `frontend`, build command `npm run build`, output directory `dist`. Set `VITE_API_URL` to the backend URL.
 - **Backend (Render):** root directory `backend`, start command `uvicorn app.main:app --host 0.0.0.0 --port $PORT`. Set `DATABASE_URL`, `LLM_API_KEY`, `LLM_MODEL` and `FRONTEND_ORIGIN` (the exact frontend URL, no trailing slash). Make sure `backend/data/index/` is committed, because the app loads the RAG index from there at startup. The logs should show `RAG index loaded` on boot. If they show `RAG index unavailable`, the app still works but answers without retrieval.
-- **Database (Render PostgreSQL):** tables are created automatically on startup.
+- **Database (Render PostgreSQL):** tables are created automatically on startup. This only creates missing tables; existing tables and data are never changed. The abuse-protection tables (`daily_token_usage`, `token_reservations`, `rate_limit_counters`) are added the same way on the first deploy.
+- **Abuse protection in production:** set `TRUSTED_PROXY_HOPS` correctly (see "Abuse protection" above) and choose `GLOBAL_DAILY_TOKEN_LIMIT` to match your budget.
 
 ## Environment variables
 

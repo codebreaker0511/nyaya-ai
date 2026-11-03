@@ -1,6 +1,9 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+
+pytestmark = pytest.mark.db
 
 
 def make_client():
@@ -41,8 +44,8 @@ def test_invalid_payload():
 
 def test_message_is_saved_with_reply(monkeypatch):
     monkeypatch.setattr("app.api.chat.rag.retrieve", lambda q, h=None: [])
-    monkeypatch.setattr("app.api.chat.llm.generate_answer", lambda q, h, p=None: "stub answer")
-    monkeypatch.setattr("app.api.chat.llm.generate_title", lambda q: "Stub Title")
+    monkeypatch.setattr("app.api.chat.llm.generate_answer", lambda q, h, p=None, **kw: "stub answer")
+    monkeypatch.setattr("app.api.chat.llm.generate_title", lambda q, usage=None: "Stub Title")
     a = make_client()
     cid = a.post("/api/conversations", json={}).json()["id"]
     r = a.post(f"/api/conversations/{cid}/messages", json={"content": "hello"})
@@ -55,12 +58,12 @@ def test_message_is_saved_with_reply(monkeypatch):
 def test_llm_failure_returns_503_but_keeps_user_message(monkeypatch):
     from app.services.llm import LLMError
 
-    def boom(q, h, p=None):
+    def boom(q, h, p=None, **kw):
         raise LLMError("The AI service is currently unavailable.")
 
     monkeypatch.setattr("app.api.chat.rag.retrieve", lambda q, h=None: [])
     monkeypatch.setattr("app.api.chat.llm.generate_answer", boom)
-    monkeypatch.setattr("app.api.chat.llm.generate_title", lambda q: None)
+    monkeypatch.setattr("app.api.chat.llm.generate_title", lambda q, usage=None: None)
     a = make_client()
     cid = a.post("/api/conversations", json={}).json()["id"]
     r = a.post(f"/api/conversations/{cid}/messages", json={"content": "hello"})
@@ -72,13 +75,13 @@ def test_retrieved_passages_are_passed_to_the_llm(monkeypatch):
     passage = {"number": "21", "text": "Article 21 text", "score": 0.6}
     seen = {}
 
-    def fake_answer(q, h, p=None):
+    def fake_answer(q, h, p=None, **kw):
         seen["passages"] = p
         return "grounded answer"
 
     monkeypatch.setattr("app.api.chat.rag.retrieve", lambda q, h=None: [passage])
     monkeypatch.setattr("app.api.chat.llm.generate_answer", fake_answer)
-    monkeypatch.setattr("app.api.chat.llm.generate_title", lambda q: None)
+    monkeypatch.setattr("app.api.chat.llm.generate_title", lambda q, usage=None: None)
     a = make_client()
     cid = a.post("/api/conversations", json={}).json()["id"]
     r = a.post(f"/api/conversations/{cid}/messages", json={"content": "what is article 21?"})

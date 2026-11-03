@@ -46,15 +46,25 @@ async function request(path, options = {}, retried = false) {
   }
   if (!res.ok) {
     let detail = 'Something went wrong. Please try again.'
+    let extra = {}
     try {
       const body = await res.json()
       if (typeof body.detail === 'string') detail = body.detail
-      else if (res.status === 422) detail = 'Please enter a valid message (up to 2000 characters).'
+      else if (body.detail && typeof body.detail.message === 'string') {
+        // Limit errors: { code, message, retry_after_seconds?, resets_at? }
+        detail = body.detail.message
+        extra = {
+          code: body.detail.code,
+          retryAfter: body.detail.retry_after_seconds,
+          resetsAt: body.detail.resets_at,
+        }
+      } else if (res.status === 422) detail = 'Please enter a valid message (up to 2000 characters).'
     } catch {
       /* keep default message */
     }
     const err = new Error(detail)
     err.status = res.status
+    Object.assign(err, extra)
     throw err
   }
   return res.status === 204 ? null : res.json()
